@@ -115,14 +115,14 @@ jobs:
         id: cache-aosp
         uses: actions/cache@v4
         with:
-          path: /aosp
+          path: $HOME/aosp
           key: aosp-${{ env.AOSP_BRANCH }}-art-bionic-v1
           restore-keys: aosp-${{ env.AOSP_BRANCH }}-art-bionic-
 
       - name: "Fase 4 – AOSP init + sync (art/ + bionic/)"
         if: steps.cache-aosp.outputs.cache-hit != 'true'
         run: |
-          mkdir -p /aosp && cd /aosp
+          mkdir -p $HOME/aosp && cd $HOME/aosp
           git config --global user.email "ztos@build.ci"
           git config --global user.name  "ZTOS Build"
 
@@ -144,11 +144,11 @@ jobs:
             2>&1 | grep -v "^Fetching\|^remote:" || true
 
           echo "Sync completato:"
-          du -sh /aosp/art /aosp/bionic
+          du -sh $HOME/aosp/art $HOME/aosp/bionic
 
       - name: "Fase 5 – Applica patch ZTOS a bionic e ART"
         run: |
-          cd /aosp
+          cd $HOME/aosp
 
           PATCH_DIR="${ZTOS_DIR}/patches"
           APPLIED=0
@@ -179,18 +179,18 @@ jobs:
         run: |
           echo "=== File modificati in bionic ==="
           grep -r "ZTOS_COMPAT\|ztos_syscall_wrapper" \
-            /aosp/bionic/libc/arch-arm64 \
+            $HOME/aosp/bionic/libc/arch-arm64 \
             --include="*.S" -l 2>/dev/null || echo "(non trovato – patch non applicata)"
 
           echo ""
           echo "=== File modificati in art ==="
           grep -r "ZTOS_COMPAT\|ztos_mmap" \
-            /aosp/art/runtime \
+            $HOME/aosp/art/runtime \
             --include="*.cc" -l 2>/dev/null || echo "(non trovato – patch non applicata)"
 
       - name: Upload AOSP patchato (tar art/ + bionic/)
         run: |
-          cd /aosp
+          cd $HOME/aosp
           tar -czf /tmp/aosp-patched.tar.gz art/ bionic/ \
             --exclude="*.git" \
             --exclude="out/" \
@@ -231,10 +231,10 @@ jobs:
 
       - name: Estrai AOSP patchato
         run: |
-          mkdir -p /aosp
-          tar -xzf /tmp/aosp-patched.tar.gz -C /aosp
+          mkdir -p $HOME/aosp
+          tar -xzf /tmp/aosp-patched.tar.gz -C $HOME/aosp
           echo "Estratto:"
-          ls /aosp/
+          ls $HOME/aosp/
 
       - name: Install Android NDK ${{ env.NDK_VERSION }}
         run: |
@@ -254,7 +254,7 @@ jobs:
         run: |
           mkdir -p /tmp/art-build && cd /tmp/art-build
 
-          cmake /aosp/art \
+          cmake $HOME/aosp/art \
             -DCMAKE_TOOLCHAIN_FILE="${ZTOS_DIR}/build/toolchain-ztos.cmake" \
             -DZTOS_COMPAT=ON \
             -DZTOS_COMPAT_LIB="${ZTOS_DIR}/artifacts/libztos_compat.a" \

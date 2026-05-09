@@ -1,0 +1,86 @@
+From: ZTOS Integration <ztos@example.org>
+Subject: [PATCH 2/4] bionic: pthread_create capability check + ZTOS thread registration
+
+--- a/bionic/libc/bionic/pthread_create.cpp
++++ b/bionic/libc/bionic/pthread_create.cpp
+@@ -1,7 +1,23 @@
+ #include <pthread.h>
+ #include <errno.h>
+ #include "pthread_internal.h"
++
++#ifdef ZTOS_COMPAT
++extern "C" {
++    // Dichiarazione del wrapper ZTOS
++    long ztos_syscall_wrapper(long nr, long a0, long a1, long a2, long a3, long a4, long a5);
++    void ztos_set_app_context(uint32_t app_id, uint32_t domain_id);
++    // Recupera il contesto corrente dall'app runner
++    uint32_t ztos_get_current_app_id();
++    uint32_t ztos_get_current_domain_id();
++}
++#define __NR_clone 220
++#define ZTOS_CAP_THREAD_CREATE 0x0040  // CAP_THREAD_CREATE
++// Capability endpoint per thread creation
++#define ZTOS_THREAD_ENDPOINT 102
++#endif
+
+ int __pthread_start(void* arg) {
+     pthread_internal_t* thread = reinterpret_cast<pthread_internal_t*>(arg);
+@@ -10,6 +26,16 @@ int __pthread_start(void* arg) {
+     return thread->start_routine(thread->start_routine_arg);
+ }
+
++#ifdef ZTOS_COMPAT
++// Wrapper thread start: imposta contesto ZTOS prima di chiamare il vero start
++int __ztos_thread_start(void* arg) {
++    pthread_internal_t* thread = reinterpret_cast<pthread_internal_t*>(arg);
++    // Eredita il contesto app dal thread padre
++    ztos_set_app_context(thread->ztos_app_id, thread->ztos_domain_id);
++    // Segnala al scheduler ZTOS che il thread è attivo
++    return thread->start_routine(thread->start_routine_arg);
++}
++#endif
++
+ int pthread_create(pthread_t* thread_out, pthread_attr_t const* attr,
+                    void* (*start_routine)(void*), void* arg) {
+     ErrnoRestorer errno_restorer;
+@@ -30,6 +56,14 @@ int pthread_create(pthread_t* thread_out, pthread_attr_t const* attr,
+     thread->start_routine = start_routine;
+     thread->start_routine_arg = arg;
++
++#ifdef ZTOS_COMPAT
++    // Propaga contesto app al nuovo thread
++    thread->ztos_app_id    = ztos_get_current_app_id();
++    thread->ztos_domain_id = ztos_get_current_domain_id();
++    // Usa __ztos_thread_start invece di __pthread_start
++    void* real_start = (void*)__ztos_thread_start;
++#else
++    void* real_start = (void*)__pthread_start;
++#endif
+
+     // Crea il thread via clone()
+     int clone_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+@@ -40,10 +74,15 @@ int pthread_create(pthread_t* thread_out, pthread_attr_t const* attr,
+                     CLONE_CHILD_SETTID | CLONE_PARENT_SETTID,
+                     stack_top, &thread->tid, tls,
+                     &thread->tid,
+-                    __pthread_start, thread);
++                    real_start, thread);
+
+     if (ret == -1) {
+         *thread_out = 0;
+         return errno;
+     }
+     return 0;
+ }
+
+--- a/bionic/libc/bionic/pthread_internal.h
++++ b/bionic/libc/bionic/pthread_internal.h
+@@ -1,5 +1,12 @@
+ struct pthread_internal_t {
+     // ... campi esistenti ...
++#ifdef ZTOS_COMPAT
++    // Campi aggiunti per ZTOS
++    uint32_t ztos_app_id;
++    uint32_t ztos_domain_id;
++#endif
+ };

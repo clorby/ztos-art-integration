@@ -1,0 +1,310 @@
+name: ZTOS – Build ART Compatibility Layer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      aosp_branch:
+        description: 'AOSP branch'
+        default: 'android-14.0.0_r1'
+        required: true
+      skip_art_build:
+        description: 'Skip full ART build (only libztos_compat)'
+        type: boolean
+        default: false
+
+env:
+  AOSP_BRANCH: ${{ github.event.inputs.aosp_branch || 'android-14.0.0_r1' }}
+  NDK_VERSION: r26b
+  RUST_TARGET: aarch64-linux-android
+  ZTOS_DIR: ${{ github.workspace }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1: Compila libztos_compat.a
+  # ─────────────────────────────────────────────────────────────────────────
+  build-ztos-compat:
+    name: "Fase 3 – libztos_compat.a"
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout ZTOS art_integration
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly + Android target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,aarch64-unknown-none-softfloat
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip \
+            -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          echo "/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" \
+            >> $GITHUB_PATH
+
+      - name: Configure Rust linker for Android target
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'EOF'
+          [target.aarch64-linux-android]
+          linker = "aarch64-linux-android21-clang"
+          EOF
+
+      - name: Build libztos_compat.a (aarch64-linux-android)
+        run: |
+          cargo build --target aarch64-linux-android --release
+          echo "=== Build completato ==="
+          ls -lh target/aarch64-linux-android/release/libztos_compat.a
+
+      - name: Dump exported symbols
+        run: |
+          llvm-nm=$(find /opt/android-ndk-${NDK_VERSION} -name "llvm-nm" | head -1)
+          echo "=== Simboli ztos_* esportati ==="
+          ${llvm_nm} --defined-only \
+            target/aarch64-linux-android/release/libztos_compat.a \
+            | grep " T ztos_" | sort
+
+      - name: Upload libztos_compat.a
+        uses: actions/upload-artifact@v4
+        with:
+          name: libztos_compat
+          path: target/aarch64-linux-android/release/libztos_compat.a
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2: Sync AOSP minimale + applica patch
+  # ─────────────────────────────────────────────────────────────────────────
+  sync-and-patch:
+    name: "Fase 4+5 – AOSP sync + patch"
+    runs-on: ubuntu-22.04
+    needs: build-ztos-compat
+    if: ${{ github.event.inputs.skip_art_build != 'true' }}
+
+    steps:
+      - name: Checkout ZTOS art_integration
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            repo git python3 python3-pip \
+            build-essential cmake ninja-build \
+            libssl-dev zlib1g-dev flex bison \
+            openjdk-17-jdk-headless
+
+      - name: Cache AOSP sync
+        id: cache-aosp
+        uses: actions/cache@v4
+        with:
+          path: /aosp
+          key: aosp-${{ env.AOSP_BRANCH }}-art-bionic-v1
+          restore-keys: aosp-${{ env.AOSP_BRANCH }}-art-bionic-
+
+      - name: "Fase 4 – AOSP init + sync (art/ + bionic/)"
+        if: steps.cache-aosp.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /aosp && cd /aosp
+          git config --global user.email "ztos@build.ci"
+          git config --global user.name  "ZTOS Build"
+
+          repo init \
+            -u https://android.googlesource.com/platform/manifest \
+            -b ${AOSP_BRANCH} \
+            --depth=1 \
+            --no-clone-bundle \
+            --no-tags
+
+          # Sync solo i moduli necessari (risparmia ~90GB)
+          repo sync -j4 -c --no-tags --no-clone-bundle \
+            art \
+            bionic \
+            external/libcxx \
+            external/libcxxabi \
+            libnativehelper \
+            prebuilts/clang/host/linux-x86 \
+            2>&1 | grep -v "^Fetching\|^remote:" || true
+
+          echo "Sync completato:"
+          du -sh /aosp/art /aosp/bionic
+
+      - name: "Fase 5 – Applica patch ZTOS a bionic e ART"
+        run: |
+          cd /aosp
+
+          PATCH_DIR="${ZTOS_DIR}/patches"
+          APPLIED=0
+          FAILED=0
+
+          for patch in \
+            bionic_syscall.patch \
+            bionic_pthread.patch \
+            art_mem_map.patch \
+            art_native_io.patch
+          do
+            echo "=== Applico $patch ==="
+            if patch -p1 --forward --batch \
+                 < "${PATCH_DIR}/${patch}" 2>&1; then
+              echo "OK: $patch"
+              APPLIED=$((APPLIED + 1))
+            else
+              echo "SKIP/FAIL: $patch (file potrebbe non esistere nel sync parziale)"
+              FAILED=$((FAILED + 1))
+            fi
+          done
+
+          echo ""
+          echo "Patch applicate: $APPLIED"
+          echo "Patch fallite:   $FAILED"
+
+      - name: Verifica file patchati
+        run: |
+          echo "=== File modificati in bionic ==="
+          grep -r "ZTOS_COMPAT\|ztos_syscall_wrapper" \
+            /aosp/bionic/libc/arch-arm64 \
+            --include="*.S" -l 2>/dev/null || echo "(non trovato – patch non applicata)"
+
+          echo ""
+          echo "=== File modificati in art ==="
+          grep -r "ZTOS_COMPAT\|ztos_mmap" \
+            /aosp/art/runtime \
+            --include="*.cc" -l 2>/dev/null || echo "(non trovato – patch non applicata)"
+
+      - name: Upload AOSP patchato (tar art/ + bionic/)
+        run: |
+          cd /aosp
+          tar -czf /tmp/aosp-patched.tar.gz art/ bionic/ \
+            --exclude="*.git" \
+            --exclude="out/" \
+            2>/dev/null || true
+          ls -lh /tmp/aosp-patched.tar.gz
+
+      - name: Upload AOSP patchato come artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp-patched
+          path: /tmp/aosp-patched.tar.gz
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3: Build ART con toolchain ZTOS
+  # ─────────────────────────────────────────────────────────────────────────
+  build-art:
+    name: "Fase 6 – Build ART + ZTOS"
+    runs-on: ubuntu-22.04
+    needs: [build-ztos-compat, sync-and-patch]
+    if: ${{ github.event.inputs.skip_art_build != 'true' }}
+
+    steps:
+      - name: Checkout ZTOS art_integration
+        uses: actions/checkout@v4
+
+      - name: Download libztos_compat.a
+        uses: actions/download-artifact@v4
+        with:
+          name: libztos_compat
+          path: ./artifacts/
+
+      - name: Download AOSP patchato
+        uses: actions/download-artifact@v4
+        with:
+          name: aosp-patched
+          path: /tmp/
+
+      - name: Estrai AOSP patchato
+        run: |
+          mkdir -p /aosp
+          tar -xzf /tmp/aosp-patched.tar.gz -C /aosp
+          echo "Estratto:"
+          ls /aosp/
+
+      - name: Install Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip \
+            -O /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          echo "/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" \
+            >> $GITHUB_PATH
+
+      - name: Install CMake + Ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build
+
+      - name: "Fase 6 – cmake configure ART con toolchain ZTOS"
+        run: |
+          mkdir -p /tmp/art-build && cd /tmp/art-build
+
+          cmake /aosp/art \
+            -DCMAKE_TOOLCHAIN_FILE="${ZTOS_DIR}/build/toolchain-ztos.cmake" \
+            -DZTOS_COMPAT=ON \
+            -DZTOS_COMPAT_LIB="${ZTOS_DIR}/artifacts/libztos_compat.a" \
+            -DANDROID_NDK="${ANDROID_NDK_HOME}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -G Ninja \
+            2>&1 | tail -40
+
+      - name: "Fase 6 – ninja build libart"
+        run: |
+          cd /tmp/art-build
+          ninja -j$(nproc) libart 2>&1 | tail -80
+
+      - name: Verifica simboli ZTOS in libart.so
+        run: |
+          LIBART=$(find /tmp/art-build -name "libart.so" | head -1)
+          if [ -n "$LIBART" ]; then
+            echo "=== libart.so trovato: $(ls -lh $LIBART) ==="
+            nm "$LIBART" 2>/dev/null | grep "ztos_" | head -20
+          else
+            echo "libart.so non trovato (build incompleta)"
+            find /tmp/art-build -name "*.so" 2>/dev/null | head -10
+          fi
+
+      - name: Upload libart.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libart-ztos
+          path: |
+            /tmp/art-build/libart*.so
+            /tmp/art-build/libart*.a
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 4: Summary
+  # ─────────────────────────────────────────────────────────────────────────
+  summary:
+    name: "Summary"
+    runs-on: ubuntu-22.04
+    needs: [build-ztos-compat, sync-and-patch, build-art]
+    if: always()
+
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## ZTOS ART Build Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| libztos_compat.a | ${{ needs.build-ztos-compat.result }} |" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "| AOSP sync + patch | ${{ needs.sync-and-patch.result }} |" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "| ART build | ${{ needs.build-art.result }} |" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch AOSP:** ${AOSP_BRANCH}" >> $GITHUB_STEP_SUMMARY

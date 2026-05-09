@@ -1,0 +1,88 @@
+From: ZTOS Integration <ztos@example.org>
+Subject: [PATCH 3/4] art: MemMap usa memory_bridge invece di mmap diretto
+
+--- a/art/runtime/mem_map.cc
++++ b/art/runtime/mem_map.cc
+@@ -1,8 +1,20 @@
+ #include "mem_map.h"
+ #include <sys/mman.h>
++
++#ifdef ZTOS_COMPAT
++// Su ZTOS, tutte le mmap vanno tramite il wrapper
++#include <ztos/syscall_compat.h>
++// Ridefinisce mmap, mprotect, munmap con le versioni ZTOS
++#define mmap     ztos_mmap
++#define munmap   ztos_munmap
++#define mprotect ztos_mprotect
++#define madvise  ztos_madvise
++#define mremap   ztos_mremap
++extern "C" {
++    void* ztos_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off);
++    int   ztos_munmap(void* addr, size_t len);
++    int   ztos_mprotect(void* addr, size_t len, int prot);
++    int   ztos_madvise(void* addr, size_t len, int advice);
++    void* ztos_mremap(void* old, size_t old_sz, size_t new_sz, int flags, ...);
++}
++#endif  // ZTOS_COMPAT
++
+ #include "base/file_utils.h"
+ #include "base/mem_map.h"
+
+@@ -45,6 +63,14 @@ MemMap MemMap::MapAnonymous(const char* name,
+                             uint8_t* addr,
+                             size_t byte_count,
+                             int prot,
++#ifdef ZTOS_COMPAT
++                            // Su ZTOS verifica capability prima di allocare
++                            bool low_4gb,
++                            std::string* error_msg) {
++    // Nota: ztos_mmap() in memory_bridge.rs esegue il controllo capability
++    void* actual_addr = ztos_mmap(addr, byte_count, prot,
++                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (actual_addr == MAP_FAILED) {
++        *error_msg = "ZTOS mmap failed: capability denied or out of memory";
++        return Invalid();
++    }
++    return MemMap(name, reinterpret_cast<uint8_t*>(actual_addr), byte_count, ...);
++#else
+                             bool low_4gb,
+                             std::string* error_msg) {
+     // implementazione originale ...
+@@ -55,6 +81,7 @@ MemMap MemMap::MapAnonymous(const char* name,
+     void* actual_addr = mmap(addr, byte_count, prot, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+     // ...
+     return MemMap(...);
++#endif  // ZTOS_COMPAT
+ }
+
+--- a/art/runtime/jit/jit_code_cache.cc
++++ b/art/runtime/jit/jit_code_cache.cc
+@@ -1,6 +1,14 @@
+ #include "jit_code_cache.h"
++
++#ifdef ZTOS_COMPAT
++// Il JIT cache in ZTOS usa il pool di memoria del memory_bridge
++// e richiede CAP_JIT_ALLOC + CAP_JIT_EXEC per mprotect(PROT_EXEC)
++extern "C" {
++    int ztos_memfd_create(const char* name, unsigned flags);
++    int ztos_ftruncate(int fd, off_t length);
++    int ztos_mprotect_exec(void* addr, size_t len); // verifica CAP_JIT_EXEC
++}
++#endif
+
+ JitCodeCache* JitCodeCache::Create(size_t initial_capacity,
+                                    size_t max_capacity,
+@@ -35,8 +51,16 @@ JitCodeCache* JitCodeCache::Create(size_t initial_capacity,
++#ifdef ZTOS_COMPAT
++    // Crea code cache usando il pool ZTOS
++    int fd = ztos_memfd_create("jit-ztos", 0);
++    if (fd < 0) return nullptr;
++    if (ztos_ftruncate(fd, max_capacity) < 0) return nullptr;
++#else
+     int fd = art::memfd_create("jit-cache", 0);
+     if (fd < 0) return nullptr;
+     if (ftruncate(fd, max_capacity) < 0) return nullptr;
++#endif
+
+     return new JitCodeCache(fd, initial_capacity, max_capacity, ...);
+ }

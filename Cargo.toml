@@ -1,0 +1,21 @@
+[package]
+name    = "ztos_compat"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name      = "ztos_compat"
+crate-type = ["staticlib"]
+
+[features]
+default = []
+
+[profile.dev]
+panic    = "abort"
+opt-level = 1
+
+[profile.release]
+panic    = "abort"
+opt-level = 2
+lto      = true
+codegen-units = 1

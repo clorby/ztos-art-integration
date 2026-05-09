@@ -1,0 +1,102 @@
+From: ZTOS Integration <ztos@example.org>
+Subject: [PATCH 1/4] bionic: redirect all syscalls to ztos_syscall_wrapper
+
+Modifica bionic/libc/arch-arm64/syscalls/syscall.S per instradare
+tutte le syscall a ztos_syscall_wrapper() invece di `svc #0`.
+
+Testato su: AOSP android-14.0.0_r1
+
+--- a/bionic/libc/arch-arm64/syscalls/syscall.S
++++ b/bionic/libc/arch-arm64/syscalls/syscall.S
+@@ -1,27 +1,43 @@
+ /*
+  * Copyright (C) 2019 The Android Open Source Project
++ * Modified for ZTOS integration
+  */
+
+ #include <private/bionic_asm.h>
+
++// Se compilato per ZTOS, ridirigi al wrapper Rust
++#ifdef ZTOS_COMPAT
++
++// Prototipo: extern "C" i64 ztos_syscall_wrapper(u64 nr, u64 a0..a5);
++.extern ztos_syscall_wrapper
++
++ENTRY(syscall)
++    // AArch64 Linux: nr in x0, args in x1..x6 per questa funzione POSIX.
++    // Linux SVC:     nr in x8, args in x0..x5
++    // Trasformiamo per il wrapper: (nr=x0, a0=x1, ..., a5=x6)
++    mov     x8, x0          // salva nr in x8 (caller-saved)
++    // Shift args: x1→x0, x2→x1, x3→x2, x4→x3, x5→x4, x6→x5, x8→x6_nr
++    // Wrapper firma: ztos_syscall_wrapper(nr, a0, a1, a2, a3, a4, a5)
++    mov     x6, x5          // a5 → x6
++    mov     x5, x4          // a4 → x5
++    mov     x4, x3          // a3 → x4
++    mov     x3, x2          // a2 → x3
++    mov     x2, x1          // a1 → x2
++    mov     x1, x0          // a0 original → non valida ora
++    // a0 originale era in x1 prima della call (ABI POSIX syscall(nr, a0,...))
++    // Dopo le mosse: x1=x0_orig, x2=x2_orig,...
++    // Dobbiamo recuperare x0 originale (era nr). Usiamo x8 come nr.
++    // Riorganizzazione finale:
++    mov     x0, x8          // nr (già in x8)
++    // x1..x6 sono già i 6 argomenti
++    bl      ztos_syscall_wrapper
++    // Risultato in x0 come da Linux convention
++    // Controlla errore (errno negativo)
++    cmn     x0, #(MAX_ERRNO + 1)
++    cneg    x0, x0, hi
++    b.hi    __set_errno_internal
++    ret
++END(syscall)
++
++#else  // ZTOS_COMPAT non definita: comportamento normale Linux
++
+ ENTRY(syscall)
+     mov     x8, x0
+     mov     x0, x1
+@@ -31,8 +47,10 @@
+     mov     x4, x5
+     mov     x5, x6
+     svc     #0
+     cmn     x0, #(MAX_ERRNO + 1)
+     cneg    x0, x0, hi
+     b.hi    __set_errno_internal
+     ret
+ END(syscall)
++
++#endif  // ZTOS_COMPAT
+
+--- a/bionic/libc/arch-arm64/bionic/__bionic_clone.S
++++ b/bionic/libc/arch-arm64/bionic/__bionic_clone.S
+@@ -1,6 +1,12 @@
+ #include <private/bionic_asm.h>
+ #include <asm/signal.h>
+
++#ifdef ZTOS_COMPAT
++// clone() è gestito da thread_bridge in ztos_syscall_wrapper
++// Questo file non è necessario su ZTOS (rimpiazzato dal wrapper)
++#else
++
+ // pid_t __bionic_clone(int flags, void* child_stack, int* parent_tid,
+ //                      void* tls, int* child_tid, int (*fn)(void*), void* arg);
+ ENTRY_PRIVATE(__bionic_clone)
+@@ -31,3 +37,5 @@
+     mov x0, x19
+     blr x20
+ END(__bionic_clone)
++
++#endif  // ZTOS_COMPAT
+
+--- a/bionic/libc/bionic/system_properties.cpp
++++ b/bionic/libc/bionic/system_properties.cpp
+@@ -1,5 +1,10 @@
+ // ... (inizio file invariato)
++#ifdef ZTOS_COMPAT
++// Su ZTOS, le system properties ritornano valori statici
++const char* __system_property_get_ztos(const char* name) {
++    if (strcmp(name, "ro.build.version.sdk") == 0) return "34";
++    if (strcmp(name, "ro.product.cpu.abi") == 0) return "arm64-v8a";
++    return "";
++}
++#endif

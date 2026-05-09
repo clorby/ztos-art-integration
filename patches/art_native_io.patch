@@ -1,0 +1,110 @@
+From: ZTOS Integration <ztos@example.org>
+Subject: [PATCH 4/4] art: libcore_io_Linux usa ztos_syscall_wrapper per tutte le I/O
+
+La classe Libcore.io.Linux (Java native) fa da ponte tra Java e il kernel.
+Su ZTOS, ogni operazione I/O deve passare per il capability check.
+
+--- a/art/runtime/native/libcore_io_Linux.cc
++++ b/art/runtime/native/libcore_io_Linux.cc
+@@ -1,8 +1,28 @@
+ #include "libcore_io_Linux.h"
+ #include <sys/syscall.h>
+ #include <errno.h>
++
++#ifdef ZTOS_COMPAT
++// Intercettiamo le syscall I/O prima che raggiungano il kernel
++#include <ztos/syscall_compat.h>
++
++// Le macro ridefiniscono le chiamate POSIX con le versioni ZTOS
++// che eseguono capability check prima di delegare all'io_bridge.
++#define open      ztos_openat_compat
++#define read      ztos_read
++#define write     ztos_write
++#define close     ztos_close
++#define lseek     ztos_lseek
++#define fstat     ztos_fstat
++#define stat      ztos_stat
++#define socket    ztos_socket
++#define connect   ztos_connect
++#define send      ztos_send
++#define recv      ztos_recv
++#define bind      ztos_bind
++#define accept    ztos_accept
++#define getaddrinfo ztos_getaddrinfo_stub
++
++extern "C" {
++    // Queste funzioni sono implementate in io_bridge.rs e net_bridge.rs
++    int   ztos_openat_compat(const char* path, int flags, ...);
++    long  ztos_read(int fd, void* buf, size_t len);
++    long  ztos_write(int fd, const void* buf, size_t len);
++    int   ztos_close(int fd);
++    off_t ztos_lseek(int fd, off_t off, int whence);
++    int   ztos_fstat(int fd, struct stat* st);
++    int   ztos_stat(const char* path, struct stat* st);
++    int   ztos_socket(int domain, int type, int proto);
++    int   ztos_connect(int fd, const struct sockaddr* addr, socklen_t len);
++    long  ztos_send(int fd, const void* buf, size_t len, int flags);
++    long  ztos_recv(int fd, void* buf, size_t len, int flags);
++    int   ztos_bind(int fd, const struct sockaddr* addr, socklen_t len);
++    int   ztos_accept(int fd, struct sockaddr* addr, socklen_t* len);
++    // Stub per getaddrinfo (usa DNS del dominio VPN)
++    int   ztos_getaddrinfo_stub(const char* node, const char* service,
++                                const struct addrinfo* hints, struct addrinfo** res);
++}
++#endif  // ZTOS_COMPAT
+
+ namespace art {
+
+ // Java_libcore_io_Linux_open
+@@ -44,12 +72,20 @@ static jobject Linux_open(JNIEnv* env, ...) {
++#ifdef ZTOS_COMPAT
++    // ZTOS: verifica capability prima di aprire
++    // L'app può aprire solo file nella sua sandbox
++    const char* path = ScopedUtfChars(env, javaPath).c_str();
++    // Il check implicito avviene in ztos_openat_compat → io_bridge::sys_openat
++    int fd = open(path, flags, mode);
++    if (fd < 0) {
++        throwErrnoException(env, "open");
++        return nullptr;
++    }
++    return jniCreateFileDescriptor(env, fd);
++#else
+     ScopedUtfChars path(env, javaPath);
+     if (path.c_str() == nullptr) return nullptr;
+     int fd = throwIfMinusOne(env, "open", TEMP_FAILURE_RETRY(open(path.c_str(), flags, mode)));
+     return (fd != -1) ? jniCreateFileDescriptor(env, fd) : nullptr;
++#endif
+ }
+
+ // Java_libcore_io_Linux_write
+@@ -89,10 +125,17 @@ static jlong Linux_write(JNIEnv* env, ...) {
++#ifdef ZTOS_COMPAT
++    // Su ZTOS: write(1/2) → CAP_STDOUT_WRITE, write(fd) → CAP_APP_STORAGE
++    jlong result = (jlong)write(fd, bytes + off, len);
++    if (result < 0) throwErrnoException(env, "write");
++    return result;
++#else
+     ScopedByteArrayRO bytes(env, javaBytes);
+     if (bytes.get() == nullptr) return -1;
+     return throwIfMinusOne(env, "write",
+         TEMP_FAILURE_RETRY(write(fd, bytes.get() + offset, byteCount)));
++#endif
+ }
+
+--- a/art/runtime/native/libcore_io_Linux.cc (socket section)
++++ b/art/runtime/native/libcore_io_Linux.cc
+@@ -301,10 +345,25 @@ static jobject Linux_socket(JNIEnv* env, ...) {
++#ifdef ZTOS_COMPAT
++    // ZTOS: socket richiede CAP_NET_SEND
++    // La verifica avviene in net_bridge::sys_socket()
++    int fd = socket(domain, type, protocol);
++    if (fd < 0) {
++        throwErrnoException(env, "socket");
++        return nullptr;
++    }
++    return jniCreateFileDescriptor(env, fd);
++#else
+     int fd = throwIfMinusOne(env, "socket", socket(domain, type, protocol));
+     return (fd != -1) ? jniCreateFileDescriptor(env, fd) : nullptr;
++#endif
+ }

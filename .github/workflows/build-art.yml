@@ -67,20 +67,27 @@ jobs:
           echo "=== Build completato ==="
           ls -lh target/aarch64-linux-android/release/libztos_compat.a
 
-      - name: Dump exported symbols
-        run: |
-          llvm-nm=$(find /opt/android-ndk-${NDK_VERSION} -name "llvm-nm" | head -1)
-          echo "=== Simboli ztos_* esportati ==="
-          ${llvm_nm} --defined-only \
-            target/aarch64-linux-android/release/libztos_compat.a \
-            | grep " T ztos_" | sort
-
       - name: Upload libztos_compat.a
         uses: actions/upload-artifact@v4
         with:
           name: libztos_compat
           path: target/aarch64-linux-android/release/libztos_compat.a
           retention-days: 30
+
+      - name: Dump exported symbols
+        continue-on-error: true
+        run: |
+          LIB=target/aarch64-linux-android/release/libztos_compat.a
+          echo "=== Libreria: $(ls -lh $LIB) ==="
+          # Usa llvm-nm dal NDK
+          LLVM_NM="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          if [ -f "$LLVM_NM" ]; then
+            echo "=== Simboli ztos_* esportati ==="
+            "$LLVM_NM" --defined-only "$LIB" | grep " T ztos_" | sort
+          else
+            echo "llvm-nm non trovato, uso nm di sistema"
+            nm --defined-only "$LIB" 2>/dev/null | grep " T ztos_" | sort || true
+          fi
 
   # ─────────────────────────────────────────────────────────────────────────
   # JOB 2: Sync AOSP minimale + applica patch

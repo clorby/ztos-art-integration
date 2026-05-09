@@ -55,13 +55,11 @@ jobs:
           echo "/opt/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" \
             >> $GITHUB_PATH
 
-      - name: Configure Rust linker for Android target
+      - name: Verify Rust linker config
         run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'EOF'
-          [target.aarch64-linux-android]
-          linker = "aarch64-linux-android21-clang"
-          EOF
+          echo "=== .cargo/config.toml ==="
+          cat .cargo/config.toml
+          which aarch64-linux-android21-clang || true
 
       - name: Build libztos_compat.a (aarch64-linux-android)
         run: |
